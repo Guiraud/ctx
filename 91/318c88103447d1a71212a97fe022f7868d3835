@@ -1,0 +1,25 @@
+crates/ctx-daemon-runtime/src/watch/metadata_poll.rs
+  s_bbfeed834ab42a::t_b3139bc2122a05 279
+  s_bbfeed834ab42a::t_4b04be931b1222 193-194,196,199,205,208-214
+  s_bbfeed834ab42a::t_37200cf29d1485 28-34,41-65,69-175
+  s_bbfeed834ab42a::t_9a7a90725b31c6 200
+  s_bbfeed834ab42a::t_905cb5bbe4eede 4-11,17
+  s_bbfeed834ab42a::t_0c71cf7147db5d 233
+  s_bbfeed834ab42a::t_65aa17cd2e28aa 334-412
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.1",
+  "base_commit_sha": "91318c88103447d1a71212a97fe022f7868d3835",
+  "prompts": {},
+  "sessions": {
+    "s_bbfeed834ab42a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8f991dd-7268-4490-9020-669e8c3090e8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Guiraud <mehdi.guiraud@gmail.com>"
+    }
+  }
+}
