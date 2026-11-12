@@ -9,6 +9,12 @@
 //! full recursive inventory runs every `FULL_SCAN_EVERY` passes. That
 //! inventory refreshes the hot set and remains the backstop for anything
 //! native notifications missed.
+//!
+//! Latency bound: an append to a hot file is seen within `POLL_INTERVAL`
+//! (5 s). One case is slower: a writer already open when watching started,
+//! then idle for longer than `HOT_WINDOW`, then appending again. Its file is
+//! cold, FSEvents does not report it, and the next full inventory sees it,
+//! within `POLL_INTERVAL * FULL_SCAN_EVERY` (60 s).
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
     Event, EventKind, RecursiveMode,
