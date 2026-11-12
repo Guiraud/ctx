@@ -1,12 +1,20 @@
 //! macOS fallback for appends to files that were already dirty when watched.
 //! Metadata only: no content hashing and no symlink traversal.
 //! The dependency's PollWatcher compares whole-second mtimes, not file lengths.
+//!
+//! Cost model: provider roots hold tens of thousands of cold transcripts, but
+//! only a handful of live journals are appended at any time. Every
+//! `POLL_INTERVAL` the watcher stats only the hot files: regular files whose
+//! mtime falls inside `HOT_WINDOW`, or that changed since the last pass. The
+//! full recursive inventory runs every `FULL_SCAN_EVERY` passes. That
+//! inventory refreshes the hot set and remains the backstop for anything
+//! native notifications missed.
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
     Event, EventKind, RecursiveMode,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -17,15 +25,154 @@ use std::{
 };
 
 type Handler = Arc<dyn Fn(notify::Result<Event>) + Send + Sync>;
+
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Full inventories run once every this many polls (60 s at the default interval).
+const FULL_SCAN_EVERY: u32 = 12;
+/// Files modified this recently are treated as possibly open for append.
+const HOT_WINDOW: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Clone, PartialEq, Eq)]
 struct Stamp {
     modified: Option<SystemTime>,
     len: u64,
     kind: u8,
 }
+
+impl Stamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            kind: if metadata.file_type().is_dir() {
+                1
+            } else if metadata.file_type().is_symlink() {
+                2
+            } else {
+                0
+            },
+        }
+    }
+
+    fn is_hot(&self, now: SystemTime) -> bool {
+        self.kind == 0
+            && self.modified.is_some_and(|modified| {
+                now.duration_since(modified)
+                    .map_or(true, |age| age <= HOT_WINDOW)
+            })
+    }
+}
+
 struct Root {
     recursive: bool,
     entries: BTreeMap<PathBuf, Stamp>,
+    hot: BTreeSet<PathBuf>,
+}
+
+impl Root {
+    fn new(recursive: bool, entries: BTreeMap<PathBuf, Stamp>) -> Self {
+        let hot = hot_set(&entries, SystemTime::now());
+        Self {
+            recursive,
+            entries,
+            hot,
+        }
+    }
+}
+
+fn hot_set(entries: &BTreeMap<PathBuf, Stamp>, now: SystemTime) -> BTreeSet<PathBuf> {
+    entries
+        .iter()
+        .filter(|(_, stamp)| stamp.is_hot(now))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Returns false when cancellation was observed.
+fn full_pass(
+    path: &Path,
+    root: &mut Root,
+    handler: &Handler,
+    canceled: &impl Fn() -> bool,
+) -> bool {
+    let current = match scan(path, root.recursive, canceled) {
+        Ok(current) => current,
+        Err(error) => {
+            if canceled() {
+                return false;
+            }
+            handler(Err(error));
+            return true;
+        }
+    };
+    for (path, stamp) in &current {
+        if canceled() {
+            return false;
+        }
+        let kind = match root.entries.get(path) {
+            None => Some(EventKind::Create(CreateKind::Any)),
+            Some(old) if old != stamp => Some(EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::WriteTime,
+            ))),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            handler(Ok(Event::new(kind).add_path(path.clone())));
+        }
+    }
+    for path in root
+        .entries
+        .keys()
+        .filter(|path| !current.contains_key(*path))
+    {
+        if canceled() {
+            return false;
+        }
+        handler(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path.clone())
+        ));
+    }
+    root.hot = hot_set(&current, SystemTime::now());
+    root.entries = current;
+    true
+}
+
+/// Stats only hot files. Returns false when cancellation was observed.
+fn hot_pass(root: &mut Root, handler: &Handler, canceled: &impl Fn() -> bool) -> bool {
+    let now = SystemTime::now();
+    let mut cooled = Vec::new();
+    for path in &root.hot {
+        if canceled() {
+            return false;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let stamp = Stamp::of(&metadata);
+                let changed = root.entries.get(path) != Some(&stamp);
+                if changed {
+                    handler(Ok(Event::new(EventKind::Modify(ModifyKind::Metadata(
+                        MetadataKind::WriteTime,
+                    )))
+                    .add_path(path.clone())));
+                } else if !stamp.is_hot(now) {
+                    cooled.push(path.clone());
+                }
+                root.entries.insert(path.clone(), stamp);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                handler(Ok(
+                    Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path.clone())
+                ));
+                root.entries.remove(path);
+                cooled.push(path.clone());
+            }
+            Err(error) => handler(Err(notify::Error::io(error).add_path(path.clone()))),
+        }
+    }
+    for path in cooled {
+        root.hot.remove(&path);
+    }
+    true
 }
 pub(super) struct MetadataWatcher {
     roots: Arc<Mutex<BTreeMap<PathBuf, Root>>>,
@@ -43,55 +190,29 @@ impl MetadataWatcher {
         let worker = thread::Builder::new()
             .name("ctx-metadata-watch".to_owned())
             .spawn(move || {
+                let is_canceled = || canceled.load(Ordering::Acquire);
+                let mut pass = 0_u32;
                 while matches!(
-                    receive.recv_timeout(Duration::from_secs(5)),
+                    receive.recv_timeout(POLL_INTERVAL),
                     Err(mpsc::RecvTimeoutError::Timeout)
                 ) {
+                    pass = pass.wrapping_add(1);
+                    let full = pass.is_multiple_of(FULL_SCAN_EVERY);
                     let mut roots = watched
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for (path, root) in roots.iter_mut() {
-                        if canceled.load(Ordering::Acquire) {
+                        if is_canceled() {
                             return;
                         }
-                        let current =
-                            match scan(path, root.recursive, || canceled.load(Ordering::Acquire)) {
-                                Ok(current) => current,
-                                Err(error) => {
-                                    if canceled.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    handler(Err(error));
-                                    continue;
-                                }
-                            };
-                        for (path, stamp) in &current {
-                            if canceled.load(Ordering::Acquire) {
-                                return;
-                            }
-                            let kind = match root.entries.get(path) {
-                                None => Some(EventKind::Create(CreateKind::Any)),
-                                Some(old) if old != stamp => Some(EventKind::Modify(
-                                    ModifyKind::Metadata(MetadataKind::WriteTime),
-                                )),
-                                _ => None,
-                            };
-                            if let Some(kind) = kind {
-                                handler(Ok(Event::new(kind).add_path(path.clone())));
-                            }
+                        let completed = if full {
+                            full_pass(path, root, &handler, &is_canceled)
+                        } else {
+                            hot_pass(root, &handler, &is_canceled)
+                        };
+                        if !completed {
+                            return;
                         }
-                        for path in root
-                            .entries
-                            .keys()
-                            .filter(|path| !current.contains_key(*path))
-                        {
-                            if canceled.load(Ordering::Acquire) {
-                                return;
-                            }
-                            handler(Ok(Event::new(EventKind::Remove(RemoveKind::Any))
-                                .add_path(path.clone())));
-                        }
-                        root.entries = current;
                     }
                 }
             })
@@ -109,7 +230,7 @@ impl MetadataWatcher {
         self.roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.to_path_buf(), Root { recursive, entries });
+            .insert(path.to_path_buf(), Root::new(recursive, entries));
         Ok(())
     }
     pub(super) fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
@@ -155,20 +276,7 @@ fn scan(
             Err(error) => return Err(notify::Error::io(error).add_path(path)),
         };
         let directory = metadata.file_type().is_dir();
-        entries.insert(
-            path.clone(),
-            Stamp {
-                modified: metadata.modified().ok(),
-                len: metadata.len(),
-                kind: if directory {
-                    1
-                } else if metadata.file_type().is_symlink() {
-                    2
-                } else {
-                    0
-                },
-            },
-        );
+        entries.insert(path.clone(), Stamp::of(&metadata));
         if directory && (recursive || depth == 0) {
             for child in
                 std::fs::read_dir(&path).map_err(|e| notify::Error::io(e).add_path(path.clone()))?
@@ -221,6 +329,85 @@ mod tests {
             .expect("same-time size change must be observed")
             .unwrap();
         assert!(event.paths.contains(&path));
+    }
+
+    fn collecting_handler() -> (Handler, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: Handler = Arc::new(move |event| {
+            if let Ok(event) = event {
+                let _ = tx.lock().unwrap().send(event);
+            }
+        });
+        (handler, rx)
+    }
+
+    fn age(path: &Path, by: Duration) {
+        let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - by))
+            .unwrap();
+    }
+
+    #[test]
+    fn hot_pass_stats_only_recent_files() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let live = temp.path().join("live.jsonl");
+        let cold = temp.path().join("cold.jsonl");
+        std::fs::write(&live, b"one\n").unwrap();
+        std::fs::write(&cold, b"one\n").unwrap();
+        age(&cold, HOT_WINDOW * 2);
+        let mut root = Root::new(true, scan(temp.path(), true, || false).unwrap());
+        assert!(root.hot.contains(&live));
+        assert!(!root.hot.contains(&cold));
+
+        let (handler, rx) = collecting_handler();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
+        assert!(hot_pass(&mut root, &handler, &|| false));
+        let paths: Vec<_> = rx.try_iter().flat_map(|event| event.paths).collect();
+        assert_eq!(paths, vec![live.clone()]);
+
+        // A cold file is left to the periodic full inventory.
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&cold)
+            .unwrap();
+        writer.write_all(b"two\n").unwrap();
+        age(&cold, HOT_WINDOW * 2);
+        assert!(hot_pass(&mut root, &handler, &|| false));
+        assert_eq!(rx.try_iter().count(), 0);
+        assert!(full_pass(temp.path(), &mut root, &handler, &|| false));
+        let paths: Vec<_> = rx.try_iter().flat_map(|event| event.paths).collect();
+        assert!(paths.contains(&cold));
+    }
+
+    #[test]
+    fn hot_pass_reports_removal_and_cools_idle_files() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let removed = temp.path().join("removed.jsonl");
+        let idle = temp.path().join("idle.jsonl");
+        std::fs::write(&removed, b"x\n").unwrap();
+        std::fs::write(&idle, b"x\n").unwrap();
+        let mut root = Root::new(true, scan(temp.path(), true, || false).unwrap());
+        let (handler, rx) = collecting_handler();
+
+        std::fs::remove_file(&removed).unwrap();
+        // Same length, older mtime: changed once, then cools on the next pass.
+        age(&idle, HOT_WINDOW * 2);
+        assert!(hot_pass(&mut root, &handler, &|| false));
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|event| {
+            matches!(event.kind, EventKind::Remove(_)) && event.paths.contains(&removed)
+        }));
+        assert!(!root.hot.contains(&removed));
+        assert!(!root.entries.contains_key(&removed));
+        assert!(root.hot.contains(&idle));
+        assert!(hot_pass(&mut root, &handler, &|| false));
+        assert!(!root.hot.contains(&idle));
     }
 
     #[test]
